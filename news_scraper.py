@@ -6,16 +6,25 @@ Fetches world news, creates daily notes and story notes with entity linking
 
 # Standard library imports
 import argparse
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
 import time
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional, Any
+from concurrent.futures import ThreadPoolExecutor
+import socket
+import subprocess
+import platform
+from urllib.request import urlopen
+from urllib.error import URLError
 
 # Third-party imports
 import feedparser
@@ -32,17 +41,266 @@ warnings.filterwarnings("ignore", message=".*return_all_scores.*", category=User
 warnings.filterwarnings("ignore", message=".*clone.*detach.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*torch.tensor.*", category=UserWarning)
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('news_scraper.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Optional AI imports
 try:
     from transformers import pipeline
     import torch
     HAS_TRANSFORMERS = True
     HAS_TORCH = True
-    print("✅ Transformers imported successfully")
+    logger.info("✅ Transformers imported successfully")
 except ImportError as e:
     HAS_TRANSFORMERS = False
     HAS_TORCH = False
-    print(f"⚠️ Transformers not available: {e}")
+    logger.warning(f"⚠️ Transformers not available: {e}")
+
+
+@dataclass
+class SchedulerState:
+    """Tracks the state of automated runs"""
+    last_run_date: Optional[datetime] = None
+    missed_days: Optional[List[datetime]] = None
+    is_running: bool = False
+    
+    def __post_init__(self):
+        if self.missed_days is None:
+            self.missed_days = []
+
+
+class SmartScheduler:
+    """Smart scheduler that handles automated runs with internet connectivity checking"""
+    
+    def __init__(self, scraper_instance, state_file: str = "scheduler_state.json"):
+        self.scraper = scraper_instance
+        self.state_file = Path(state_file)
+        self.state = self._load_state()
+        self.check_interval = 300  # Check every 5 minutes when waiting for internet
+        
+    def _load_state(self) -> SchedulerState:
+        """Load scheduler state from file"""
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                    return SchedulerState(
+                        last_run_date=datetime.fromisoformat(data.get('last_run_date')) if data.get('last_run_date') else None,
+                        missed_days=[datetime.fromisoformat(d) for d in data.get('missed_days', [])],
+                        is_running=data.get('is_running', False)
+                    )
+            except Exception as e:
+                logger.warning(f"Error loading scheduler state: {e}")
+        
+        return SchedulerState()
+    
+    def _save_state(self):
+        """Save scheduler state to file"""
+        data = {
+            'last_run_date': self.state.last_run_date.isoformat() if self.state.last_run_date else None,
+            'missed_days': [d.isoformat() for d in (self.state.missed_days or [])],
+            'is_running': self.state.is_running
+        }
+        
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving scheduler state: {e}")
+    
+    def check_internet_connection(self) -> bool:
+        """Check if internet connection is available"""
+        try:
+            # Try to connect to a reliable host
+            urlopen('http://www.google.com', timeout=5)
+            return True
+        except URLError:
+            pass
+        
+        # Fallback: try DNS resolution
+        try:
+            socket.gethostbyname('www.google.com')
+            return True
+        except socket.gaierror:
+            pass
+        
+        return False
+    
+    def get_next_run_time(self) -> datetime:
+        """Get the next scheduled run time (5 AM today or tomorrow)"""
+        now = datetime.now()
+        target_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
+        
+        # If it's already past 5 AM today, schedule for tomorrow
+        if now >= target_time:
+            target_time = target_time + timedelta(days=1)
+        
+        return target_time
+    
+    def should_run_today(self) -> bool:
+        """Check if we should run today (5 AM or catching up missed days)"""
+        now = datetime.now()
+        today = now.date()
+        
+        # Check if it's 5 AM
+        if now.hour == 5 and now.minute < 30:  # Allow 30-minute window
+            return True
+        
+        # Check if we have missed days to catch up
+        return len(self.state.missed_days or []) > 0
+    
+    def add_missed_day(self, date: datetime):
+        """Add a day to the missed days list"""
+        if self.state.missed_days is None:
+            self.state.missed_days = []
+        
+        date_only = date.date()
+        if date_only not in [d.date() for d in self.state.missed_days]:
+            self.state.missed_days.append(date)
+            self.state.missed_days.sort()
+            self._save_state()
+            logger.info(f"Added missed day: {date_only}")
+    
+    def remove_missed_day(self, date: datetime):
+        """Remove a day from the missed days list"""
+        if self.state.missed_days is None:
+            return
+        
+        date_only = date.date()
+        self.state.missed_days = [d for d in self.state.missed_days if d.date() != date_only]
+        self._save_state()
+    
+    def get_days_to_run(self) -> List[datetime]:
+        """Get list of days that need to be run"""
+        days_to_run = []
+        now = datetime.now()
+        
+        # Add today's run if it's time
+        if now.hour == 5 and now.minute < 30:
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if not self.state.last_run_date or self.state.last_run_date.date() != today.date():
+                days_to_run.append(today)
+        
+        # Add missed days
+        if self.state.missed_days:
+            days_to_run.extend(self.state.missed_days)
+        
+        return sorted(days_to_run)
+    
+    def run_scheduled_scrape(self) -> bool:
+        """Run the scheduled scrape for appropriate days"""
+        if not self.check_internet_connection():
+            logger.info("No internet connection, skipping scheduled run")
+            return False
+        
+        days_to_run = self.get_days_to_run()
+        
+        if not days_to_run:
+            logger.info("No days to run today")
+            return True
+        
+        success = True
+        
+        for run_date in days_to_run:
+            logger.info(f"Running scheduled scrape for {run_date.strftime('%d %m %Y')}")
+            
+            try:
+                # Run the scrape
+                scrape_success = self.scraper.run_daily_scrape(run_date)
+                
+                if scrape_success:
+                    # Update state
+                    self.state.last_run_date = datetime.now()
+                    self.remove_missed_day(run_date)
+                    logger.info(f"Successfully completed scrape for {run_date.strftime('%d %m %Y')}")
+                else:
+                    logger.warning(f"Scrape skipped for {run_date.strftime('%d %m %Y')} (already exists)")
+                    self.remove_missed_day(run_date)
+                    
+            except Exception as e:
+                logger.error(f"Error running scrape for {run_date.strftime('%d %m %Y')}: {e}")
+                success = False
+        
+        self._save_state()
+        return success
+    
+    def start_monitoring(self):
+        """Start monitoring for scheduled runs"""
+        logger.info("Starting smart scheduler monitoring...")
+        
+        while True:
+            try:
+                if self.should_run_today():
+                    if self.check_internet_connection():
+                        logger.info("Internet available, running scheduled scrape")
+                        self.run_scheduled_scrape()
+                    else:
+                        logger.info("No internet connection, will retry later")
+                
+                # Check for missed days when internet is restored
+                if self.check_internet_connection() and self.state.missed_days:
+                    logger.info(f"Internet restored, processing {len(self.state.missed_days)} missed days")
+                    self.run_scheduled_scrape()
+                
+                # Sleep until next check
+                time.sleep(self.check_interval)
+                
+            except KeyboardInterrupt:
+                logger.info("Scheduler monitoring stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Error in scheduler monitoring: {e}")
+                time.sleep(self.check_interval)
+    
+    def schedule_daily_runs(self):
+        """Schedule daily runs at 5 AM with catch-up for missed days"""
+        logger.info("Setting up daily schedule at 5 AM...")
+        
+        while True:
+            try:
+                now = datetime.now()
+                next_run = self.get_next_run_time()
+                wait_seconds = (next_run - now).total_seconds()
+                
+                if wait_seconds > 0:
+                    logger.info(f"Next run scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                    time.sleep(min(wait_seconds, self.check_interval))
+                else:
+                    # It's time to run
+                    if self.check_internet_connection():
+                        logger.info("Running scheduled daily scrape")
+                        self.run_scheduled_scrape()
+                    else:
+                        # No internet, add to missed days and wait
+                        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                        self.add_missed_day(today)
+                        logger.info("No internet connection, added to missed days")
+                        
+                        # Wait for internet
+                        while not self.check_internet_connection():
+                            logger.info("Waiting for internet connection...")
+                            time.sleep(self.check_interval)
+                        
+                        logger.info("Internet connection restored, running catch-up")
+                        self.run_scheduled_scrape()
+                    
+                    # Wait until tomorrow
+                    time.sleep(24 * 60 * 60)  # 24 hours
+                    
+            except KeyboardInterrupt:
+                logger.info("Daily scheduling stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Error in daily scheduling: {e}")
+                time.sleep(self.check_interval)
 
 
 @dataclass
@@ -55,6 +313,185 @@ class OngoingEvent:
     last_updated: datetime
     total_articles: int = 0
     importance_score: float = 0.0
+
+
+class NewsConfig:
+    """Configuration for the news scraper with validation and environment variable support"""
+    
+    # Class constants for thresholds and limits
+    MAX_TITLE_LENGTH = 80
+    MIN_ENTITY_LENGTH = 2
+    EVENT_SCORE_THRESHOLD = 1.0
+    AI_KEYWORD_SCORE_BOOST = 2.0
+    ENTITY_SCORE_WEIGHT = 2.0
+    MAX_RELATED_STORIES = 5
+    SUMMARIZATION_MAX_CHARS = 1024
+    
+    # Cross-day duplicate detection settings
+    DUPLICATE_DETECTION_DAYS = 7
+    TITLE_SIMILARITY_THRESHOLD = 0.75
+    ENTITY_OVERLAP_THRESHOLD = 0.5
+    ENABLE_ADVANCED_DUPLICATE_DETECTION = True
+    
+    def __init__(self):
+        """Initialize configuration with validation"""
+        self._load_configuration()
+        self._validate_configuration()
+    
+    def _load_configuration(self):
+        """Load configuration from environment variables with defaults"""
+        # Obsidian vault path - configurable via environment variable
+        default_vault_path = "/Users/adaikkappankrishnan/Library/Mobile Documents/iCloud~md~obsidian/Documents/News"
+        vault_path_str = os.getenv('OBSIDIAN_VAULT_PATH', default_vault_path)
+        self.vault_path = Path(vault_path_str)
+        
+        # Create derived paths
+        self.output_path = self.vault_path
+        self.stories_path = self.vault_path / "stories"
+        self.entities_path = self.vault_path / "entities"
+        self.topics_path = self.vault_path / "topics"
+        self.timelines_path = self.vault_path / "timelines"
+        
+        # NewsAPI configuration - configurable via environment variables
+        self.newsapi_key = os.getenv('NEWSAPI_KEY', "2df1a771b56b4884a01a00ffcd1ab136")
+        self.newsapi_url = os.getenv('NEWSAPI_URL', "https://newsapi.org/v2/top-headlines")
+        
+        # Regional quotas - configurable via environment variable
+        regional_quotas_str = os.getenv('REGIONAL_QUOTAS', 'Africa:3,Middle East:4,Asia:8,Europe:8,US:7')
+        self.regional_quotas = self._parse_regional_quotas(regional_quotas_str)
+        
+        # AI/ML features - configurable via environment variables
+        self.enable_full_text_extraction = self._str_to_bool(os.getenv('ENABLE_FULL_TEXT_EXTRACTION', 'true'))
+        self.enable_sentiment_analysis = self._str_to_bool(os.getenv('ENABLE_SENTIMENT_ANALYSIS', 'true'))
+        self.enable_topic_modeling = self._str_to_bool(os.getenv('ENABLE_TOPIC_MODELING', 'true'))
+        self.enable_auto_summarization = self._str_to_bool(os.getenv('ENABLE_AUTO_SUMMARIZATION', 'true'))
+        
+        # Maximum articles per day - configurable
+        self.max_articles_per_day = int(os.getenv('MAX_ARTICLES_PER_DAY', '30'))
+        
+        # Readability threshold - configurable
+        self.readability_threshold = float(os.getenv('READABILITY_THRESHOLD', '30'))
+        
+        # Entity types to extract
+        self.entity_types = {'PERSON', 'ORG', 'GPE', 'EVENT', 'WORK_OF_ART'}
+        
+        # Minimum entity overlap for linking
+        self.min_entity_overlap = 1
+        
+        # Content analysis settings
+        self.tracked_topics = {
+            "ukraine", "climate", "election", "economy", "health", 
+            "china", "russia", "israel", "palestine", "crypto", "space", "technology"
+        }
+        
+        # RSS feeds - can be overridden via environment variable
+        default_rss_feeds = [
+            "https://feeds.bbci.co.uk/news/world/rss.xml",
+            "https://feeds.reuters.com/reuters/topNews",
+            "https://feeds.theguardian.com/theguardian/world/rss",
+            "https://feeds.npr.org/1001/rss.xml",
+            "https://rss.dw.com/rdf/rss-en-world",
+            "https://feeds.washingtonpost.com/rss/world",
+            "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
+            "https://www.straitstimes.com/news/world/rss.xml",
+            "https://www.scmp.com/rss/4/feed",
+            "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+            "https://www.thehindu.com/news/international/feeder/default.rss",
+            "https://feeds.a24media.com/aljazeera/en/news/rss.xml",
+            "https://www.france24.com/en/rss",
+            "https://feeds.feedburner.com/newsweek",
+            "https://rss.cnn.com/rss/edition_space.rss",
+        ]
+        
+        rss_feeds_str = os.getenv('RSS_FEEDS')
+        if rss_feeds_str:
+            self.rss_feeds = [feed.strip() for feed in rss_feeds_str.split(',') if feed.strip()]
+        else:
+            self.rss_feeds = default_rss_feeds
+        
+        # Source to region mapping
+        self.source_region_map = {
+            "cnn": "US", "nbc": "US", "cbs": "US", "abc": "US", "fox": "US", 
+            "washingtonpost": "US", "nytimes": "US", "npr": "US", "usatoday": "US",
+            "bbc": "Europe", "reuters": "Europe", "theguardian": "Europe", 
+            "dw": "Europe", "euronews": "Europe", "france24": "Europe",
+            "straitstimes": "Asia", "scmp": "Asia", "japantimes": "Asia", 
+            "timesofindia": "Asia", "chinadaily": "Asia", "koreatimes": "Asia",
+            "aljazeera": "Middle East", "arabnews": "Middle East", "haaretz": "Middle East",
+            "allafrica": "Africa", "dailymaverick": "Africa", "mg": "Africa"
+        }
+    
+    def _parse_regional_quotas(self, quotas_str: str) -> Dict[str, int]:
+        """Parse regional quotas from environment variable string"""
+        quotas = {}
+        try:
+            for pair in quotas_str.split(','):
+                if ':' in pair:
+                    region, quota = pair.split(':', 1)
+                    quotas[region.strip()] = int(quota.strip())
+        except (ValueError, AttributeError):
+            print(f"Warning: Invalid REGIONAL_QUOTAS format: {quotas_str}, using defaults")
+            return {
+                "Africa": 3, "Middle East": 4, "Asia": 8, "Europe": 8, "US": 7
+            }
+        return quotas
+    
+    def _str_to_bool(self, value: str) -> bool:
+        """Convert string to boolean"""
+        if not value:
+            return False
+        return value.lower() in ('true', '1', 'yes', 'on')
+    
+    def _validate_configuration(self):
+        """Validate critical configuration settings"""
+        errors = []
+        
+        # Validate vault path
+        if not self.vault_path.exists():
+            try:
+                self.vault_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Created vault directory: {self.vault_path}")
+            except Exception as e:
+                errors.append(f"Cannot create vault directory: {e}")
+        
+        # Validate NewsAPI key
+        if not self.newsapi_key or self.newsapi_key == "YOUR_NEWSAPI_KEY_HERE":
+            errors.append("NewsAPI key not configured. Set NEWSAPI_KEY environment variable.")
+        
+        # Validate RSS feeds
+        if not self.rss_feeds:
+            errors.append("No RSS feeds configured")
+        
+        # Validate regional quotas
+        if not self.regional_quotas:
+            errors.append("No regional quotas configured")
+        
+        # Validate numeric settings
+        if self.max_articles_per_day <= 0:
+            errors.append("max_articles_per_day must be positive")
+        
+        if self.readability_threshold < 0 or self.readability_threshold > 100:
+            errors.append("readability_threshold must be between 0 and 100")
+        
+        if errors:
+            error_msg = "Configuration validation errors:\n" + "\n".join(f"  - {error}" for error in errors)
+            logger.error(error_msg)
+            if any("NewsAPI key" in error for error in errors):
+                logger.warning("Note: NewsAPI functionality will be disabled until key is configured")
+            else:
+                raise ValueError(error_msg)
+    
+    def get_summary(self) -> str:
+        """Get configuration summary for logging"""
+        return f"""
+Configuration Summary:
+- Vault Path: {self.vault_path}
+- NewsAPI Key: {'Configured' if self.newsapi_key != 'YOUR_NEWSAPI_KEY_HERE' else 'Not configured'}
+- RSS Feeds: {len(self.rss_feeds)} sources
+- Regional Quotas: {self.regional_quotas}
+- AI Features: Sentiment={self.enable_sentiment_analysis}, Summarization={self.enable_auto_summarization}
+- Max Articles/Day: {self.max_articles_per_day}
+"""
 
 
 class EventTracker:
@@ -147,6 +584,7 @@ class EventTracker:
         event_articles = defaultdict(list)
         
         for article in articles:
+            # Cache article text processing outside the event loop for efficiency
             article_text = f"{article.title} {article.description} {article.content}".lower()
             article_entities = {entity.lower() for entity in article.entities}
             
@@ -1872,75 +2310,131 @@ class CrossDayDuplicateDetector:
         union = len(set1.union(set2))
         return intersection / union if union > 0 else 0.0
     
+    def _fuzzy_title_match(self, title_words1: List[str], title_words2: List[str]) -> float:
+        """Calculate fuzzy similarity between two title word lists"""
+        if not title_words1 or not title_words2:
+            return 0.0
+        
+        # Convert to sets for intersection
+        set1 = set(title_words1)
+        set2 = set(title_words2)
+        
+        # Basic Jaccard similarity
+        jaccard = self._calculate_jaccard_similarity(set1, set2)
+        
+        # Bonus for sequential matches (words in same order)
+        sequential_bonus = 0.0
+        min_len = min(len(title_words1), len(title_words2))
+        if min_len >= 3:
+            # Check for common subsequences
+            common_seq = 0
+            for i in range(min_len - 1):
+                if (title_words1[i] in set2 and 
+                    i < len(title_words1) - 1 and 
+                    title_words1[i + 1] in set2):
+                    common_seq += 1
+            
+            if common_seq > 0:
+                sequential_bonus = min(0.2, common_seq / min_len)
+        
+        # Length similarity bonus
+        len_similarity = 1.0 - abs(len(title_words1) - len(title_words2)) / max(len(title_words1), len(title_words2))
+        length_bonus = (len_similarity - 0.5) * 0.1 if len_similarity > 0.5 else 0.0
+        
+        return min(1.0, jaccard + sequential_bonus + length_bonus)
+    
     def _is_likely_duplicate(self, article: 'NewsArticle', existing_signature: Dict[str, Any]) -> Tuple[bool, str, float]:
         """Check if article is likely a duplicate of existing signature"""
         current_signature = self._create_article_signature(article)
-        
+
         # Initialize default similarity scores
         title_similarity = 0.0
         entity_similarity = 0.0
-        
+
         # Method 1: Exact title hash match
         if current_signature['title_hash'] == existing_signature['title_hash']:
             return True, "exact_title_match", 1.0
-        
+
         # Method 2: Title fingerprint match (key words)
-        if (current_signature['title_fingerprint'] and 
+        if (current_signature['title_fingerprint'] and
             existing_signature['title_fingerprint'] and
             current_signature['title_fingerprint'] == existing_signature['title_fingerprint']):
             return True, "title_fingerprint_match", 0.95
-        
+
         # Method 3: High title word similarity
         current_words = set(current_signature['title_normalized'])
         existing_words = set(existing_signature['title_normalized'])
         title_similarity = self._calculate_jaccard_similarity(current_words, existing_words)
-        
+
         # Calculate entity overlap for later checks
         current_entities = set(current_signature['entities'])
         existing_entities = set(existing_signature['entities'])
         entity_similarity = self._calculate_jaccard_similarity(current_entities, existing_entities)
-        
-        if title_similarity >= self.title_similarity_threshold:
+
+        # Check if articles are from the same day (more lenient for same-day duplicates)
+        same_day = (datetime.fromisoformat(current_signature['date']).date() ==
+                   datetime.fromisoformat(existing_signature['date']).date())
+
+        # IMPROVED LOGIC: More flexible duplicate detection
+        same_source = current_signature['source'] == existing_signature['source']
+
+        # Method 3a: High title similarity (relaxed for same-day articles)
+        title_threshold = 0.7 if same_day else self.title_similarity_threshold  # 0.7 for same day, 0.8 otherwise
+        if title_similarity >= title_threshold:
             # Additional checks for high similarity
-            
-            # Same source makes it more likely to be duplicate
-            same_source = current_signature['source'] == existing_signature['source']
-            
-            # Combine factors for final decision
-            if same_source and entity_similarity >= self.entity_overlap_threshold:
+            if same_source and entity_similarity >= 0.4:  # Lower entity threshold
                 return True, "high_similarity_same_source", title_similarity
-            elif title_similarity >= 0.9 and entity_similarity >= 0.5:
+            elif title_similarity >= 0.85:  # Very high title similarity
                 return True, "very_high_title_similarity", title_similarity
-        
+            elif same_day and title_similarity >= 0.75 and entity_similarity >= 0.3:
+                return True, "same_day_high_similarity", title_similarity
+
+        # Method 3b: Fuzzy title matching for partial matches
+        fuzzy_title_match = self._fuzzy_title_match(
+            current_signature['title_normalized'],
+            existing_signature['title_normalized']
+        )
+        if fuzzy_title_match >= 0.8:  # 80% fuzzy match
+            return True, "fuzzy_title_match", fuzzy_title_match
+
         # Method 4: Entity hash match (same key entities, likely same story)
-        if (current_signature['entity_hash'] and 
+        if (current_signature['entity_hash'] and
             existing_signature['entity_hash'] and
             current_signature['entity_hash'] == existing_signature['entity_hash'] and
             len(current_signature['entities']) >= 2):  # Minimum entities for reliable match
-            
-            # Check if titles are reasonably similar too
-            if title_similarity >= 0.5:  # Lower threshold since entities match
+
+            # More lenient title check since entities match perfectly
+            if title_similarity >= 0.4:  # Much lower threshold since entities match
                 return True, "entity_hash_match", entity_similarity
-        
-        # Method 5: Content hash match
+
+        # Method 5: High entity overlap with moderate title similarity
+        if entity_similarity >= 0.7 and title_similarity >= 0.5:
+            return True, "high_entity_overlap", entity_similarity
+
+        # Method 6: Same-day articles with significant overlap
+        if same_day and entity_similarity >= 0.5 and title_similarity >= 0.6:
+            return True, "same_day_entity_overlap", max(title_similarity, entity_similarity)
+
+        # Method 7: Content hash match
         if current_signature['content_hash'] == existing_signature['content_hash']:
             return True, "content_hash_match", 0.9
-        
+
         return False, "no_match", 0.0
     
     def check_for_duplicates(self, articles: List['NewsArticle']) -> Tuple[List['NewsArticle'], List[Dict]]:
         """Check articles against existing database and return non-duplicates"""
         unique_articles = []
         duplicate_info = []
-        
+        articles_to_add = []  # Collect articles to add after all processing
+
         for article in articles:
             is_duplicate = False
             duplicate_details = None
-            
-            # Check against existing signatures
+
+            # Check against existing signatures (don't modify database during checking)
             for existing_id, existing_signature in self.article_signatures.items():
                 is_dup, method, confidence = self._is_likely_duplicate(article, existing_signature)
-                
+
                 if is_dup:
                     duplicate_details = {
                         'article_title': article.title,
@@ -1954,16 +2448,21 @@ class CrossDayDuplicateDetector:
                     duplicate_info.append(duplicate_details)
                     is_duplicate = True
                     break
-            
+
             if not is_duplicate:
-                # Not a duplicate, add to unique list and register signature
+                # Not a duplicate, add to unique list
                 unique_articles.append(article)
-                article_id = f"{article.published_at.strftime('%Y%m%d')}_{article.hash}"
-                self.article_signatures[article_id] = self._create_article_signature(article)
-        
+                # Collect for adding to database later
+                articles_to_add.append(article)
+
+        # Only after all articles are processed, add unique ones to database
+        for article in articles_to_add:
+            article_id = f"{article.published_at.strftime('%Y%m%d')}_{hash(article.title + article.url)}"
+            self.article_signatures[article_id] = self._create_article_signature(article)
+
         # Save updated database
         self._save_signature_database()
-        
+
         return unique_articles, duplicate_info
     
     def cleanup_old_signatures(self):
@@ -2012,112 +2511,6 @@ class CrossDayDuplicateDetector:
             'oldest_signature': min(dates.keys()) if dates else None,
             'newest_signature': max(dates.keys()) if dates else None,
             'database_file_size': self.duplicate_db_file.stat().st_size if self.duplicate_db_file.exists() else 0
-        }
-
-
-class NewsConfig:
-    """Configuration for the news scraper"""
-    
-    # Configuration constants
-    MAX_TITLE_LENGTH = 80
-    MIN_ENTITY_LENGTH = 2
-    EVENT_SCORE_THRESHOLD = 1.0
-    AI_KEYWORD_SCORE_BOOST = 2.0
-    ENTITY_SCORE_WEIGHT = 2.0
-    MAX_RELATED_STORIES = 5
-    SUMMARIZATION_MAX_CHARS = 1024
-    
-    # Cross-day duplicate detection settings
-    DUPLICATE_DETECTION_DAYS = 7  # Days to check back for duplicates
-    TITLE_SIMILARITY_THRESHOLD = 0.8  # Jaccard similarity threshold
-    ENTITY_OVERLAP_THRESHOLD = 0.6  # Entity overlap threshold for duplicates
-    ENABLE_ADVANCED_DUPLICATE_DETECTION = True  # Enable the new system
-    
-    def __init__(self):
-        # Obsidian vault path
-        self.vault_path = Path("/Users/adaikkappankrishnan/Library/Mobile Documents/iCloud~md~obsidian/Documents/News")
-        self.output_path = self.vault_path  # Add output_path for user profile
-        self.stories_path = self.vault_path / "stories"
-        self.entities_path = self.vault_path / "entities"
-        self.topics_path = self.vault_path / "topics"
-        self.timelines_path = self.vault_path / "timelines"
-        
-        # NewsAPI configuration
-        self.newsapi_key = "2df1a771b56b4884a01a00ffcd1ab136"
-        self.newsapi_url = "https://newsapi.org/v2/top-headlines"
-        
-        # Regional quotas for balanced coverage
-        self.regional_quotas = {
-            "Africa": 3,
-            "Middle East": 4,
-            "Asia": 8,
-            "Europe": 8,
-            "US": 7,
-        }
-        
-        # Source to region mapping
-        self.source_region_map = {
-            # US sources
-            "cnn": "US", "nbc": "US", "cbs": "US", "abc": "US", "fox": "US", 
-            "washingtonpost": "US", "nytimes": "US", "npr": "US", "usatoday": "US",
-            # Europe sources  
-            "bbc": "Europe", "reuters": "Europe", "theguardian": "Europe", 
-            "dw": "Europe", "euronews": "Europe", "france24": "Europe",
-            # Asia sources
-            "straitstimes": "Asia", "scmp": "Asia", "japantimes": "Asia", 
-            "timesofindia": "Asia", "chinadaily": "Asia", "koreatimes": "Asia",
-            # Middle East sources
-            "aljazeera": "Middle East", "arabnews": "Middle East", "haaretz": "Middle East",
-            # Africa sources
-            "allafrica": "Africa", "dailymaverick": "Africa", "mg": "Africa"
-        }
-        
-        # RSS feeds for diverse, high-quality global news sources
-        self.rss_feeds = [
-            # Premium English-language sources
-            "https://feeds.bbci.co.uk/news/world/rss.xml",
-            "https://feeds.reuters.com/reuters/topNews",
-            "https://feeds.theguardian.com/theguardian/world/rss",
-            "https://feeds.npr.org/1001/rss.xml",
-            "https://rss.dw.com/rdf/rss-en-world",
-            "https://feeds.washingtonpost.com/rss/world",
-            
-            # Asian perspectives
-            "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
-            "https://www.straitstimes.com/news/world/rss.xml",
-            "https://www.scmp.com/rss/4/feed",
-            "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-            "https://www.thehindu.com/news/international/feeder/default.rss",
-            
-            # Additional quality sources
-            "https://feeds.a24media.com/aljazeera/en/news/rss.xml",
-            "https://www.france24.com/en/rss",
-            "https://feeds.feedburner.com/newsweek",
-            
-            # Space/Science (CNN only)
-            "https://rss.cnn.com/rss/edition_space.rss",
-        ]
-        
-        # AI/ML features - now enabled with optimized models
-        self.enable_full_text_extraction = True
-        self.enable_sentiment_analysis = True
-        self.enable_topic_modeling = True
-        self.enable_auto_summarization = True
-        
-        # Entity types to extract
-        self.entity_types = {'PERSON', 'ORG', 'GPE', 'EVENT', 'WORK_OF_ART'}
-        
-        # Minimum entity overlap for linking
-        self.min_entity_overlap = 1
-        
-        # Content analysis settings
-        self.max_articles_per_day = 30
-        self.readability_threshold = 30  # Flesch reading ease score
-        
-        # Major topics to track
-        self.tracked_topics = {
-            "ukraine", "climate", "election", "economy", "health", 
-            "china", "russia", "israel", "palestine", "crypto", "space", "technology"
         }
 
 
@@ -2557,13 +2950,43 @@ class NewsArticle:
 
 
 class NewsScraper:
-    """Main news scraper class with advanced AI features"""
+    """Main news scraper class with advanced AI features and async support"""
     
     def __init__(self, config: NewsConfig):
         self.config = config
         self.nlp = None
         self.sentiment_pipeline = None
         self.summarizer = None
+        
+        # HTTP session for connection pooling and better performance
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'NewsScraper/1.0 (https://github.com/your-repo/news-scraper)'
+        })
+        
+        # Async HTTP session for concurrent operations
+        self.async_session = None
+        
+        # Thread pool for CPU-bound operations
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
+        # Caching layer
+        self.cache = {}
+        self.cache_ttl = 3600  # 1 hour
+        
+        # Metrics collection
+        self.metrics = {
+            'articles_processed': 0,
+            'articles_filtered': 0,
+            'duplicates_found': 0,
+            'api_requests': 0,
+            'api_errors': 0,
+            'processing_time': 0.0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
+        self.start_time = time.time()
+        
         self.event_tracker = EventTracker(config)
         self.source_tracker = SourceReliabilityTracker(config)
         self.geo_cluster = GeographicEventCluster()
@@ -2575,14 +2998,126 @@ class NewsScraper:
         self.timeline_builder = EventTimelineBuilder(config)
         self._load_models()
         self._ensure_directories()
+    
+    def _get_cache_key(self, url: str, params: Optional[Dict] = None) -> str:
+        """Generate cache key for URL and parameters"""
+        key_parts = [url]
+        if params:
+            # Sort params for consistent caching
+            sorted_params = sorted(params.items())
+            key_parts.extend(f"{k}={v}" for k, v in sorted_params)
+        return hashlib.md5("|".join(key_parts).encode()).hexdigest()
+    
+    def _get_cached_response(self, cache_key: str) -> Optional[Dict]:
+        """Get cached response if still valid"""
+        if cache_key in self.cache:
+            cached_data, timestamp = self.cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                logger.debug(f"Cache hit for {cache_key}")
+                return cached_data
+            else:
+                # Remove expired cache entry
+                del self.cache[cache_key]
+        return None
+    
+    def _cache_response(self, cache_key: str, data: Dict):
+        """Cache response data"""
+        self.cache[cache_key] = (data, time.time())
+        # Limit cache size to prevent memory issues
+        if len(self.cache) > 1000:
+            # Remove oldest entries
+            oldest_keys = sorted(self.cache.keys(), 
+                               key=lambda k: self.cache[k][1])[:100]
+            for key in oldest_keys:
+                del self.cache[key]
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status"""
+        uptime = time.time() - self.start_time
+        
+        return {
+            'status': 'healthy',
+            'uptime_seconds': uptime,
+            'metrics': self.metrics.copy(),
+            'config_valid': self._validate_config_health(),
+            'dependencies': self._check_dependencies(),
+            'cache_stats': {
+                'size': len(self.cache),
+                'ttl': self.cache_ttl
+            }
+        }
+    
+    def _validate_config_health(self) -> bool:
+        """Validate configuration is healthy"""
+        try:
+            # Check critical paths exist
+            required_paths = [
+                self.config.vault_path,
+                self.config.stories_path,
+                self.config.entities_path
+            ]
+            return all(path.exists() for path in required_paths)
+        except:
+            return False
+    
+    def _check_dependencies(self) -> Dict[str, bool]:
+        """Check if all dependencies are available"""
+        return {
+            'spacy': self.nlp is not None,
+            'transformers': HAS_TRANSFORMERS,
+            'torch': HAS_TORCH,
+            'newsapi': bool(self.config.newsapi_key and 
+                          self.config.newsapi_key != "YOUR_NEWSAPI_KEY_HERE")
+        }
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get detailed performance statistics"""
+        uptime = time.time() - self.start_time
+        
+        return {
+            'uptime_hours': uptime / 3600,
+            'articles_per_hour': self.metrics['articles_processed'] / max(uptime / 3600, 1),
+            'cache_hit_ratio': (self.metrics['cache_hits'] / 
+                              max(self.metrics['cache_hits'] + self.metrics['cache_misses'], 1)),
+            'api_success_rate': (1 - self.metrics['api_errors'] / 
+                               max(self.metrics['api_requests'], 1)),
+            'avg_processing_time': (self.metrics['processing_time'] / 
+                                  max(self.metrics['articles_processed'], 1))
+        }
+    
+    async def __aenter__(self):
+        """Async context manager entry"""
+        self.async_session = aiohttp.ClientSession(
+            headers={'User-Agent': 'NewsScraper/1.0'},
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.async_session:
+            await self.async_session.close()
+    
+    def __del__(self):
+        """Cleanup resources"""
+        try:
+            if hasattr(self, 'session'):
+                self.session.close()
+            if hasattr(self, 'executor'):
+                self.executor.shutdown(wait=False)
+            if hasattr(self, 'async_session') and self.async_session:
+                # Note: async_session cleanup should be handled by async context manager
+                pass
+        except:
+            pass  # Ignore errors during cleanup
         
     def _load_models(self):
         """Load spaCy and transformer models"""
         try:
             self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            print("ERROR: spaCy English model not found!")
-            print("Please install it with: python -m spacy download en_core_web_sm")
+        except OSError as e:
+            logger.error("spaCy English model not found!")
+            logger.error("Please install it with: python -m spacy download en_core_web_sm")
             raise
         
         # Load lightweight transformer models with GPU support
@@ -2594,17 +3129,17 @@ class NewsScraper:
         
         try:
             if self.config.enable_sentiment_analysis and HAS_TRANSFORMERS:
-                print("🔄 Loading sentiment analysis model...")
+                logger.info("🔄 Loading sentiment analysis model...")
                 self.sentiment_pipeline = pipeline(
                     "sentiment-analysis", 
                     model="distilbert-base-uncased-finetuned-sst-2-english",
                     top_k=1,
                     device=device
                 )
-                print(f"✅ Loaded sentiment model on {device}")
+                logger.info(f"✅ Loaded sentiment model on {device}")
                 
             if self.config.enable_auto_summarization and HAS_TRANSFORMERS:
-                print("🔄 Loading summarization model...")
+                logger.info("🔄 Loading summarization model...")
                 self.summarizer = pipeline(
                     "summarization", 
                     model="facebook/bart-large-cnn",
@@ -2612,11 +3147,11 @@ class NewsScraper:
                     min_length=30,
                     device=device
                 )
-                print(f"✅ Loaded summarization model on {device}")
+                logger.info(f"✅ Loaded summarization model on {device}")
                 
         except Exception as e:
-            print(f"⚠️ Could not load transformer models: {e}")
-            print("Continuing with basic features only...")
+            logger.warning(f"⚠️ Could not load transformer models: {e}")
+            logger.warning("Continuing with basic features only...")
             self.sentiment_pipeline = None
             self.summarizer = None
     
@@ -2629,16 +3164,16 @@ class NewsScraper:
         try:
             # Try MPS first (Apple Silicon GPU)
             if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                print("🚀 Using MacBook GPU (MPS) for AI models")
+                logger.info("🚀 Using MacBook GPU (MPS) for AI models")
                 return "mps"
             elif torch.cuda.is_available():
-                print("🚀 Using CUDA GPU for AI models")
+                logger.info("🚀 Using CUDA GPU for AI models")
                 return 0
             else:
-                print("💻 Using CPU for AI models")
+                logger.info("💻 Using CPU for AI models")
                 return -1
         except Exception as e:
-            print(f"💻 Device detection failed, using CPU: {e}")
+            logger.warning(f"💻 Device detection failed, using CPU: {e}")
             return -1
     
     def _ensure_directories(self):
@@ -2664,7 +3199,7 @@ class NewsScraper:
                 'sortBy': 'publishedAt'
             }
             
-            response = requests.get(self.config.newsapi_url, params=params, timeout=10)
+            response = self.session.get(self.config.newsapi_url, params=params, timeout=10)
             response.raise_for_status()
             
             data = response.json()
@@ -2855,50 +3390,50 @@ class NewsScraper:
         # Sort by quality score (higher is better)
         scored_articles.sort(key=lambda x: x[1], reverse=True)
         processed_articles = [article for article, score in scored_articles]
-        
-        # Apply intelligent selection with regional balance
-        selected = self._intelligent_article_selection(processed_articles)
-        
-        # Apply cross-day duplicate detection
+
+        # Apply cross-day duplicate detection FIRST (before selection)
         if self.config.ENABLE_ADVANCED_DUPLICATE_DETECTION:
-            print(f"🔍 Checking {len(selected)} articles for cross-day duplicates...")
-            unique_selected, duplicate_info = self.duplicate_detector.check_for_duplicates(selected)
-            
+            print(f"🔍 Checking {len(processed_articles)} articles for cross-day duplicates...")
+            unique_articles, duplicate_info = self.duplicate_detector.check_for_duplicates(processed_articles)
+
             if duplicate_info:
                 print(f"🚫 Filtered out {len(duplicate_info)} duplicate articles:")
                 for dup in duplicate_info[:5]:  # Show first 5 duplicates
                     print(f"   - '{dup['article_title'][:60]}...' - {dup['reason']}")
                 if len(duplicate_info) > 5:
                     print(f"   ... and {len(duplicate_info) - 5} more duplicates")
-            
+
             # Clean up old signatures periodically (every run)
             self.duplicate_detector.cleanup_old_signatures()
-            
+
             # Generate duplicate detection report
             if duplicate_info:
                 self._create_duplicate_report(duplicate_info)
         else:
             print("⚠️ Advanced duplicate detection disabled in config")
-            unique_selected = selected
+            unique_articles = processed_articles
             duplicate_info = []
+
+        # Apply intelligent selection with regional balance (on unique articles only)
+        selected = self._intelligent_article_selection(unique_articles)
         
         # 📈 Advanced Story Tracking & Analysis
         print(f"📈 Analyzing story evolution and coverage patterns...")
         
         # Track story evolution vs duplicates
-        evolution_report = self._analyze_story_evolution(unique_selected)
+        evolution_report = self._analyze_story_evolution(selected)
         
         # Analyze coverage gaps
-        coverage_analysis = self.coverage_analyzer.analyze_daily_coverage(unique_selected)
+        coverage_analysis = self.coverage_analyzer.analyze_daily_coverage(selected)
         
         # Build event timelines
-        timeline_updates = self._build_event_timelines(unique_selected)
+        timeline_updates = self._build_event_timelines(selected)
         
         # Create comprehensive analysis report
         self._create_advanced_analysis_report(evolution_report, coverage_analysis, timeline_updates)
         
-        print(f"✅ Selected {len(unique_selected)} unique articles after duplicate filtering")
-        return unique_selected[:self.config.max_articles_per_day]
+        print(f"✅ Selected {len(selected)} unique articles after duplicate filtering")
+        return selected[:self.config.max_articles_per_day]
 
     def _create_duplicate_report(self, duplicate_info: List[Dict]):
         """Create a report of detected duplicates for analysis"""
@@ -2923,79 +3458,130 @@ class NewsScraper:
             print(f"⚠️ Could not create duplicate report: {e}")
 
     def _calculate_article_quality(self, article: NewsArticle) -> float:
-        """Calculate quality score for article selection with strict news filtering"""
-        score = 50.0  # Base score
-        
-        # Immediate disqualification for promotional content
-        title_lower = article.title.lower()
-        description_lower = article.description.lower()
-        
-        # Heavy penalties for promotional indicators
-        promotional_flags = [
+        """Multi-factor quality scoring with normalization"""
+        factors = {
+            'recency': self._score_recency(article.published_at),
+            'source_credibility': self._score_source_credibility(article.source),
+            'content_length': self._score_content_length(article),
+            'entity_richness': self._score_entity_richness(article.entities),
+            'sentiment_balance': self._score_sentiment_balance(article.sentiment) if hasattr(article, 'sentiment') and article.sentiment else 0.5
+        }
+
+        # Weighted combination with normalization
+        weights = {
+            'recency': 0.25,
+            'source_credibility': 0.30,
+            'content_length': 0.15,
+            'entity_richness': 0.20,
+            'sentiment_balance': 0.10
+        }
+
+        # Calculate weighted score
+        quality_score = sum(score * weights[factor] for factor, score in factors.items())
+
+        # Apply promotional content penalty
+        if self._is_promotional_content(article):
+            quality_score *= 0.1  # Heavy penalty but not complete disqualification
+
+        return quality_score
+
+    def _score_recency(self, published_at: datetime) -> float:
+        """Score article recency (0-1 scale, higher is better)"""
+        days_old = (datetime.now() - published_at).days
+
+        if days_old == 0:
+            return 1.0  # Today
+        elif days_old == 1:
+            return 0.8  # Yesterday
+        elif days_old <= 3:
+            return 0.6  # 2-3 days old
+        elif days_old <= 7:
+            return 0.3  # 4-7 days old
+        else:
+            return 0.0  # Too old
+
+    def _score_source_credibility(self, source: str) -> float:
+        """Score source credibility (0-1 scale, higher is better)"""
+        source_lower = source.lower()
+
+        # Premium sources
+        if any(premium in source_lower for premium in ['reuters', 'bbc', 'ap', 'npr']):
+            return 0.95
+
+        # Major newspapers
+        if any(major in source_lower for major in ['nytimes', 'washingtonpost', 'theguardian']):
+            return 0.85
+
+        # Regional quality sources
+        if any(regional in source_lower for regional in ['straitstimes', 'scmp', 'dw', 'france24']):
+            return 0.75
+
+        # Default for unknown sources
+        return 0.5
+
+    def _score_content_length(self, article: NewsArticle) -> float:
+        """Score content length (0-1 scale, higher is better)"""
+        # Check title length
+        title_words = len(article.title.split())
+        if title_words < 5:
+            return 0.3  # Too short
+        elif title_words > 20:
+            return 0.7  # Good length
+        else:
+            return 0.9  # Optimal length
+
+    def _score_entity_richness(self, entities) -> float:
+        """Score entity richness (0-1 scale, higher is better)"""
+        if not entities:
+            return 0.0
+
+        entity_count = len(entities)
+        if entity_count >= 5:
+            return 1.0  # Rich in entities
+        elif entity_count >= 3:
+            return 0.7  # Good entity coverage
+        elif entity_count >= 1:
+            return 0.4  # Some entities
+        else:
+            return 0.1  # Very few entities
+
+    def _score_sentiment_balance(self, sentiment) -> float:
+        """Score sentiment balance (0-1 scale, higher is better)"""
+        # Handle different sentiment formats
+        if isinstance(sentiment, dict):
+            # If sentiment is a dict, extract the compound score or average
+            if 'compound' in sentiment:
+                sentiment_value = sentiment['compound']
+            else:
+                # Calculate average of available sentiment scores
+                scores = [v for v in sentiment.values() if isinstance(v, (int, float))]
+                sentiment_value = sum(scores) / len(scores) if scores else 0.0
+        elif isinstance(sentiment, (int, float)):
+            sentiment_value = float(sentiment)
+        else:
+            return 0.5  # Default neutral
+
+        # Prefer neutral to slightly positive sentiment for news
+        if -0.1 <= sentiment_value <= 0.3:
+            return 1.0  # Balanced/neutral
+        elif -0.3 <= sentiment_value <= 0.5:
+            return 0.7  # Slightly biased but acceptable
+        else:
+            return 0.3  # Too biased
+
+    def _is_promotional_content(self, article: NewsArticle) -> bool:
+        """Check if article appears to be promotional content"""
+        text_to_check = f"{article.title} {article.description}".lower()
+
+        promotional_indicators = [
             'review', 'pricing', 'features', 'marketing tools', 'ai studio',
             'sponsored', 'promo', 'deal', 'discount', 'offer', 'sale',
             'top 10', 'top 11', 'best tools', 'complete guide', 'ultimate guide',
-            'everything you need to know', 'how to make money', 'affiliate'
+            'everything you need to know', 'how to make money', 'affiliate',
+            'buy now', 'subscribe', 'download free', 'limited time'
         ]
-        
-        for flag in promotional_flags:
-            if flag in title_lower or flag in description_lower:
-                return 0.0  # Immediate disqualification
-        
-        # Check article age - heavily penalize old articles
-        days_old = (datetime.now() - article.published_at).days
-        if days_old > 7:
-            return 0.0  # Disqualify articles older than 7 days
-        elif days_old > 3:
-            score -= days_old * 10  # Heavy penalty for articles 3-7 days old
-        elif days_old > 1:
-            score -= days_old * 5   # Moderate penalty for articles 1-3 days old
-        
-        # Readability bonus (readable but not too simple)
-        if hasattr(article, 'readability_score') and article.readability_score:
-            if 30 <= article.readability_score <= 70:
-                score += 15
-            elif article.readability_score > 70:
-                score += 10
-            else:
-                score += 5
-        
-        # Entity richness (more entities = more informative)
-        if article.entities:
-            score += min(len(article.entities) * 3, 20)
-        
-        # Topic relevance (tracked topics get boost)
-        if article.topics:
-            score += len(article.topics) * 5
-        
-        # Source reliability (premium sources get boost)
-        source_lower = article.source.lower()
-        if any(source in source_lower for source in ['bbc', 'reuters', 'guardian', 'npr', 'dw', 'ap']):
-            score += 15
-        elif any(source in source_lower for source in ['cnn', 'washington post', 'new york times']):
-            score += 10
-        
-        # Sentiment balance (not too extreme)
-        if hasattr(article, 'sentiment') and article.sentiment:
-            compound = abs(article.sentiment.get('compound', 0))
-            if 0.1 <= compound <= 0.8:  # Moderate but clear sentiment
-                score += 8
-        
-        # Title quality (not too short, not clickbait-y)
-        title_len = len(article.title)
-        if 40 <= title_len <= 100:
-            score += 5
-        
-        # Heavy penalties for clickbait indicators
-        clickbait_words = [
-            'shocking', 'unbelievable', 'you won\'t believe', 'incredible', 'amazing',
-            'mind-blowing', 'viral', 'trending', 'must see', 'will shock you',
-            'doctors hate', 'secret revealed', 'exposed', 'truth about'
-        ]
-        if any(word in title_lower for word in clickbait_words):
-            score -= 20  # Heavy penalty for clickbait
-        
-        return max(0.0, score)
+
+        return any(indicator in text_to_check for indicator in promotional_indicators)
     
     def _intelligent_article_selection(self, articles: List[NewsArticle]) -> List[NewsArticle]:
         """Select articles with regional balance and quality scoring"""
@@ -4357,6 +4943,10 @@ def main():
     parser = argparse.ArgumentParser(description="Daily News Scraper for Obsidian")
     parser.add_argument('--date', type=str, help='Target date (DD MM YYYY or YYYY-MM-DD), defaults to today')
     parser.add_argument('--vault-path', type=str, help='Path to Obsidian vault News folder')
+    parser.add_argument('--health', action='store_true', help='Show health status and exit')
+    parser.add_argument('--stats', action='store_true', help='Show performance statistics and exit')
+    parser.add_argument('--schedule', action='store_true', help='Run in scheduled mode (5 AM daily with catch-up)')
+    parser.add_argument('--monitor', action='store_true', help='Run in monitoring mode (continuous internet checking)')
     
     args = parser.parse_args()
     
@@ -4366,6 +4956,67 @@ def main():
     if args.vault_path:
         config.vault_path = Path(args.vault_path)
         config.stories_path = config.vault_path / "stories"
+    
+    # Create scraper instance
+    try:
+        scraper = NewsScraper(config)
+    except Exception as e:
+        print(f"❌ Error initializing scraper: {e}")
+        return 1
+    
+    # Handle health check
+    if args.health:
+        try:
+            health = scraper.get_health_status()
+            print("🔍 Health Status:")
+            print(f"  Status: {health['status']}")
+            print(".1f")
+            print(f"  Config Valid: {health['config_valid']}")
+            print(f"  Cache Size: {health['cache_stats']['size']}")
+            print("  Dependencies:")
+            for dep, available in health['dependencies'].items():
+                status = "✅" if available else "❌"
+                print(f"    {dep}: {status}")
+            return 0
+        except Exception as e:
+            print(f"❌ Error getting health status: {e}")
+            return 1
+    
+    # Handle stats
+    if args.stats:
+        try:
+            stats = scraper.get_performance_stats()
+            print("📊 Performance Statistics:")
+            print(".1f")
+            print(".1f")
+            print(".1%")
+            print(".1%")
+            print(".2f")
+            return 0
+        except Exception as e:
+            print(f"❌ Error getting performance stats: {e}")
+            return 1
+    
+    # Handle scheduled mode
+    if args.schedule or args.monitor:
+        scheduler = SmartScheduler(scraper)
+        
+        if args.schedule:
+            print("🕐 Starting scheduled mode (runs at 5 AM daily with catch-up)")
+            try:
+                scheduler.schedule_daily_runs()
+            except KeyboardInterrupt:
+                print("\n🛑 Scheduled mode stopped by user")
+                return 0
+        elif args.monitor:
+            print("👀 Starting monitoring mode (continuous internet checking)")
+            try:
+                scheduler.start_monitoring()
+            except KeyboardInterrupt:
+                print("\n🛑 Monitoring mode stopped by user")
+                return 0
+        
+        return 0
     
     # Parse target date
     target_date = datetime.now()
@@ -4383,7 +5034,6 @@ def main():
     
     # Create scraper and run
     try:
-        scraper = NewsScraper(config)
         success = scraper.run_daily_scrape(target_date)
         
         if success:

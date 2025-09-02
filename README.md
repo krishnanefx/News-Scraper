@@ -32,6 +32,13 @@ An intelligent, fully automated news aggregation system that fetches, analyzes, 
 - **Self-Monitoring** - Prevents duplicate runs and handles errors gracefully
 - **Zero Configuration** - Just run the setup script and it works forever
 
+### 🤖 Smart Scheduling with Internet Awareness
+- **Automated Daily Runs** - Runs at 5 AM every day automatically
+- **Internet Connectivity Detection** - Waits for internet if not connected
+- **Missed Day Catch-up** - Automatically runs for missed days when internet is restored
+- **Persistent State Tracking** - Remembers last run and missed days
+- **Flexible Scheduling Modes** - Choose between scheduled or monitoring modes
+
 ## 📁 Project Structure
 
 ```
@@ -42,6 +49,9 @@ NewsScraper/
 ├── SETUP.md                    # Setup instructions
 ├── LICENSE                     # MIT License
 ├── .gitignore                  # Git ignore rules
+├── setup_automation.sh         # One-click automation setup
+├── test_scheduler.sh           # Test scheduler functionality
+├── scheduler_state.json        # Persistent scheduler state
 ├── config/                     # Configuration files
 │   ├── com.newsscraper.daemon.plist    # LaunchAgent (interval-based)
 │   └── com.newsscraper.daily.plist     # Legacy calendar-based (deprecated)
@@ -88,6 +98,125 @@ NewsScraper/
    ```bash
    bash scripts/watchdog.sh
    ```
+
+## 🤖 Smart Scheduling Features
+
+The news scraper now includes intelligent scheduling that automatically handles internet connectivity and missed days.
+
+### Automated Setup
+
+For the easiest setup, run the automation script:
+
+```bash
+./setup_automation.sh
+```
+
+This will:
+- ✅ Create a launchd service that runs at 5 AM daily
+- ✅ Configure automatic log rotation
+- ✅ Set up proper working directories
+- ✅ Enable the service to start automatically
+
+### Manual Scheduling Options
+
+#### Option 1: Scheduled Mode (Recommended)
+Runs at 5 AM daily and catches up on missed days:
+
+```bash
+python news_scraper.py --schedule
+```
+
+#### Option 2: Monitoring Mode
+Continuously monitors for internet and runs when appropriate:
+
+```bash
+python news_scraper.py --monitor
+```
+
+#### Option 3: Manual Testing
+Test specific dates or run immediately:
+
+```bash
+# Run for today
+python news_scraper.py
+
+# Run for specific date
+python news_scraper.py --date "03 09 2025"
+
+# Run for yesterday
+python news_scraper.py --date "01 09 2025"
+```
+
+### How Smart Scheduling Works
+
+1. **Daily Schedule**: Automatically runs at 5 AM every day
+2. **Internet Detection**: Checks connectivity before running
+3. **Missed Day Tracking**: If no internet at 5 AM, marks day as missed
+4. **Catch-up Mode**: When internet is restored, runs for all missed days
+5. **State Persistence**: Saves progress in `scheduler_state.json`
+6. **Duplicate Prevention**: Won't run multiple times for the same day
+
+### Scheduler State File
+
+The `scheduler_state.json` file tracks:
+```json
+{
+  "last_run_date": "2025-09-02T14:55:21.522000",
+  "missed_days": ["2025-09-01T00:00:00"],
+  "is_running": false
+}
+```
+
+### Testing the Scheduler
+
+Test the scheduler functionality:
+
+```bash
+./test_scheduler.sh
+```
+
+This will verify:
+- ✅ Internet connectivity detection
+- ✅ State management (add/remove missed days)
+- ✅ Next run time calculation
+- ✅ Basic scheduler functionality
+
+### Managing the Service
+
+```bash
+# Check if service is running
+launchctl list | grep newsscraper
+
+# Stop the service
+launchctl unload ~/Library/LaunchAgents/com.newsscraper.daily.plist
+
+# Start the service
+launchctl load ~/Library/LaunchAgents/com.newsscraper.daily.plist
+
+# View logs
+tail -f auto_run.log
+tail -f auto_run_error.log
+```
+
+### Troubleshooting
+
+**Service not starting:**
+```bash
+# Check launchd logs
+log show --predicate 'process == "launchctl"' --last 1h
+```
+
+**Internet connectivity issues:**
+```bash
+# Test internet manually
+python -c "from news_scraper import SmartScheduler, NewsScraper, NewsConfig; config = NewsConfig(); scraper = NewsScraper(config); scheduler = SmartScheduler(scraper); print('Internet:', scheduler.check_internet_connection())"
+```
+
+**Missed days not catching up:**
+```bash
+# Check scheduler state
+cat scheduler_state.json
+```
 
 ### Automation Setup
 
