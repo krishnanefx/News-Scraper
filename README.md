@@ -158,3 +158,7 @@ News/
 - Designed for [Obsidian](https://obsidian.md/)
 
 Please respect the terms of service of the news sources and APIs you use.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
