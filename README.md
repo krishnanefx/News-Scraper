@@ -86,7 +86,7 @@ python news_scraper.py --monitor               # continuous internet monitoring 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `OBSIDIAN_VAULT_PATH` | author's iCloud vault path | Output folder |
-| `NEWSAPI_KEY` | built-in key | NewsAPI key for supplementary articles |
+| `NEWSAPI_KEY` | none (optional) | NewsAPI key for supplementary articles |
 | `NEWSAPI_URL` | `https://newsapi.org/v2/top-headlines` | NewsAPI endpoint |
 | `RSS_FEEDS` | 15 built-in feeds | Comma-separated feed URLs to override the list |
 | `REGIONAL_QUOTAS` | `Africa:3,Middle East:4,Asia:8,Europe:8,US:7` | Articles per region |

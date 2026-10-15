@@ -353,7 +353,7 @@ class NewsConfig:
         self.timelines_path = self.vault_path / "timelines"
         
         # NewsAPI configuration - configurable via environment variables
-        self.newsapi_key = os.getenv('NEWSAPI_KEY', "REMOVED_NEWSAPI_KEY")
+        self.newsapi_key = os.getenv('NEWSAPI_KEY', '')
         self.newsapi_url = os.getenv('NEWSAPI_URL', "https://newsapi.org/v2/top-headlines")
         
         # Regional quotas - configurable via environment variable
